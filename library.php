@@ -1,0 +1,482 @@
+<?php
+
+/**
+ * manufakturGitDownloads
+ *
+ * @author Ralf Hertsch <ralf.hertsch@phpmanufaktur.de>
+ * @link http://phpmanufaktur.de
+ * @copyright 2012
+ * @license MIT License (MIT) http://www.opensource.org/licenses/MIT
+ */
+
+// include class.secure.php to protect this file and the whole CMS!
+if (defined('WB_PATH')) {
+  if (defined('LEPTON_VERSION'))
+    include(WB_PATH.'/framework/class.secure.php');
+}
+else {
+  $oneback = "../";
+  $root = $oneback;
+  $level = 1;
+  while (($level < 10) && (!file_exists($root.'/framework/class.secure.php'))) {
+    $root .= $oneback;
+    $level += 1;
+  }
+  if (file_exists($root.'/framework/class.secure.php')) {
+    include($root.'/framework/class.secure.php');
+  }
+  else {
+    trigger_error(sprintf("[ <b>%s</b> ] Can't include class.secure.php!", $_SERVER['SCRIPT_NAME']), E_USER_ERROR);
+  }
+}
+// end include class.secure.php
+
+// wb2lepton compatibility
+if (!defined('LEPTON_PATH')) require_once WB_PATH . '/modules/' . basename(dirname(__FILE__)) . '/wb2lepton.php';
+
+class githubDownloads {
+
+  static private $error = '';
+  static private $config_file = '';
+  static public $config = array();
+  static public $status = array(
+      'status_code' => 'ok',
+      'status_message' => '',
+      'last_repository' => '',
+      'execution_time' => 0
+      );
+  static private $script_time_start = 0;
+  static private $script_time_max = 25;
+
+
+
+  /**
+   * Constructor for githubDownloads
+   */
+  public function __construct() {
+    self::$config_file = LEPTON_PATH.'/modules/'.basename(dirname(__FILE__)).'/config.json';
+    self::$config = $this->readConfiguration();
+    self::$script_time_start = microtime(true);
+  } // __construct()
+
+  /**
+   * Get the actual error message
+   *
+   * @return string
+   */
+  public function getError() {
+    return self::$error;
+  } // getError()
+
+  /**
+   * Set the actual error message
+   *
+   * @param string $error
+   */
+  protected function setError($error = '') {
+    self::$error = $error;
+  } // setError()
+
+  /**
+   * Check if actual an error exists
+   *
+   * @return boolean
+   */
+  public function isError() {
+    return (bool) !empty(self::$error);
+  }
+
+  /**
+   * Write the configuration file in json format
+   *
+   * @param array $config
+   * @return boolean
+   */
+  public function writeConfiguration($config) {
+    if (!file_put_contents(self::$config_file, json_encode($config))) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, sprintf('Error writing the configuration file %s', self::$config_file)));
+      return false;
+    }
+    return true;
+  } // writeConfiguration()
+
+  /**
+   * Read the configuration file
+   *
+   * @return boolean|array FALSE on error or array with the configuration data
+   */
+  public function readConfiguration() {
+    if (!file_exists(self::$config_file)) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, sprintf('The configuration file %s does not exists!', self::$config_file)));
+      return false;
+    }
+    if (false === ($result = file_get_contents(self::$config_file))) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, 'Error reading the configuration file %s.', self::$config_file));
+      return false;
+    }
+
+    $result = json_decode($result, true);
+    return $result;
+  } // readConfiguration()
+
+  /**
+   * GET command to Github
+   *
+   * @param string $get
+   * @return mixed
+   */
+  protected function gitGet($get) {
+    $ch = curl_init("https://api.github.com$get?callback=return");
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $result = curl_exec($ch);
+    curl_close($ch);
+    $matches = array();
+    preg_match('/{(.*)}/', $result, $matches);
+    return json_decode($matches[0], true);
+  } // gitGet()
+
+  /**
+   * Get the data for a repository from the database
+   *
+   * @param string $owner
+   * @param string $repository_name
+   * @return boolean|array: FALSE on error, data record on success
+   */
+  public function getRepositoryData($owner, $repository_name) {
+    global $database;
+    $SQL = "SELECT * FROM `".TABLE_PREFIX."mod_github_downloads` WHERE ".
+        "`repository_name`='$repository_name' AND `owner`='$owner'";
+    if (false === ($query = $database->query($SQL))) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+      return false;
+    }
+    if ($query->numRows() > 0) {
+      // get the data record for this repository
+      return $query->fetchRow(MYSQL_ASSOC);
+    }
+    return false;
+  } // getRepositoryData()
+
+  /**
+   * Get the downloads for the specified $repository and add in the config.json
+   * saved historical download counts
+   *
+   * @param string $repository_name
+   * @param boolen $add_historic_count default is TRUE
+   * @return integer|boolean: count on success or FALSE on error
+   */
+  public function getRepositoryDownloadCount($repository_name, $add_historic_count=true) {
+    global $database;
+    $SQL = "SELECT `download_total` FROM `".TABLE_PREFIX."mod_github_downloads` WHERE ".
+        "`repository_name`='$repository_name' AND `owner`='".self::$config['owner']."'";
+    if (null === ($count = $database->get_one($SQL, MYSQL_ASSOC))) {
+      if ($database->is_error()) {
+        $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+        return false;
+      }
+      // repository not found - return zero
+      $count = 0;
+    }
+    if ($add_historic_count && isset(self::$config['history'][$repository_name]))
+      $count += self::$config['history'][$repository_name];
+    return $count;
+  } // getRepositoryDownloadCount()
+
+  /**
+   * Get all downloads for all repositories and add add all in the config.json
+   * saved historical download counts
+   *
+   * @param boolean $add_historic_count
+   * @return integer|boolean: count on success or FALSE on error
+   */
+  public function getRepositoriesDownloadTotal($add_historic_count=true) {
+    global $database;
+    $SQL = "SELECT SUM(`download_total`) AS `total` FROM `".TABLE_PREFIX."mod_github_downloads` WHERE ".
+        "`owner`='".self::$config['owner']."'";
+    if (null === ($count = $database->get_one($SQL, MYSQL_ASSOC))) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+      return false;
+    }
+    if ($add_historic_count && (isset(self::$config['history'])))
+        $count += array_sum(self::$config['history']);
+    return $count;
+  } // getRepositoriesDownloadTotal()
+
+  /**
+   * Isert a new repository record into the database and init it with the base informations
+   *
+   * @param string $owner of the repository
+   * @param boolean $is_organisation TRUE if the owner is an organisation
+   * @param string $repository_name the github name of the repository
+   * @param string $repository_url the github url of the repository
+   * @return boolean|array false on error, data record on success
+   */
+  protected function initRepositoryData($owner, $is_organisation, $repository_name, $repository_url) {
+    global $database;
+    $SQL = "INSERT INTO `".TABLE_PREFIX."mod_github_downloads` (`owner`,`is_organisation`,".
+        "`repository_name`,`repository_url`,`download_active`) VALUES ('$owner','$is_organisation',".
+        "'$repository_name','$repository_url','0')";
+    if (!$database->query($SQL)) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+      return false;
+    }
+    return $this->getRepositoryData($owner, $repository_name);
+  } // initRepositioryData()
+
+  /**
+   * Update the repository record
+   *
+   * @param integer $repository_id
+   * @param array $data record of the repository
+   * @return boolean result
+   */
+  protected function updateRepositoryData($repository_id, $data) {
+    global $database;
+    $values = '';
+    foreach ($data as $key => $value) {
+      if (($key == 'id') || ($key == 'timestamp')) continue;
+      if (!empty($values)) $values .= ' ,';
+      $values .= "`$key`='$value'";
+    }
+    $SQL = sprintf("UPDATE `%smod_github_downloads` SET %s WHERE `id`='%d'",
+        TABLE_PREFIX, $values, $repository_id);
+    if (!$database->query($SQL)) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+      return false;
+    }
+    return true;
+  } // updateRepositoryData()
+
+  /**
+   * Update the status database record.
+   * This function uses the property array self::$status
+   *
+   * @return boolean
+   */
+  protected function updateStatusData() {
+    global $database;
+    foreach (self::$status as $name => $value) {
+      if (is_numeric($name)) continue;
+      $SQL = sprintf("INSERT INTO `%smod_github_downloads_status` (`name`, `value`) VALUES ('%s','%s') ON DUPLICATE KEY UPDATE `value`='%s'",
+          TABLE_PREFIX, $name, $value, $value);
+      if (!$database->query($SQL)) {
+        $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+        return false;
+      }
+    }
+    return true;
+  } // updateStatusData()
+
+  /**
+   * Get the last status from the database record and set the property array self::$status
+   *
+   * @return boolean
+   */
+  protected function getStatusData() {
+    global $database;
+    $SQL = "SELECT * FROM `".TABLE_PREFIX."mod_github_downloads_status`";
+    if (false === ($query = $database->query($SQL))) {
+      $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+      return false;
+    }
+    $data = array();
+    while (false !== ($item = $query->fetchRow(MYSQL_ASSOC))) $data[] = $item;
+    foreach ($data as $item) {
+      self::$status[$item['name']] = $item['value'];
+    }
+    return true;
+  } // getStatusData()
+
+  /**
+   * Connect to github, walk through all repositories of the owner and get the download statistics
+   *
+   * @return boolean true on success
+   */
+  public function getRepositories() {
+    global $database;
+    $command = "/orgs/".self::$config['owner']."/repos";
+    $worker = $this->gitGet($command);
+    $repos = array();
+    $this->getStatusData();
+    if (!isset($worker['meta'])) {
+      // general error connecting to github
+      $this->setError(sprintf('[%s - %s][%s] %s', __METHOD__, __LINE__, $command,
+          'Error connecting to github.'));
+      self::$status['status_code'] = 'error';
+      self::$status['status_message'] = $this->getError();
+      self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+      $this->updateStatusData();
+      return false;
+    }
+    elseif ($worker['meta']['status'] == 200) {
+      foreach ($worker['data'] as $repo) {
+        if (self::$status['status_code'] == 'abort') {
+          if ($repo['name'] == self::$status['last_repository']) {
+            self::$status['status_code'] = 'ok';
+          }
+          else {
+            // walk through without further action
+            continue;
+          }
+        }
+        if ((microtime(true) - self::$script_time_start) > self::$script_time_max) {
+          // abort script before running out of time...
+          self::$status['status_code'] = 'abort';
+          self::$status['status_message'] = '';
+          self::$status['last_repository'] = $repo['name'];
+          self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+          $this->updateStatusData();
+          return true;
+        }
+        // check if a data record for this repo exists
+        if (false === ($data = $this->getRepositoryData(self::$config['owner'], $repo['name']))) {
+          if ($this->isError()) return false;
+          // ok - create a new data record
+          if (false === ($data = $this->initRepositoryData(self::$config['owner'],
+              self::$config['is_organisation'], $repo['name'], $repo['html_url']))) {
+            self::$status['status_code'] = 'error';
+            self::$status['status_message'] = $this->getError();
+            self::$status['last_repository'] = $repo['name'];
+            self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+            $this->updateStatusData();
+            return false;
+          }
+        }
+        $downloads = 0;
+        if ($repo['has_downloads'] == 1) {
+          // this repositories has downloads
+          $get = "/repos/".self::$config['owner']."/".$repo['name']."/downloads";
+          $dl = $this->gitGet($get);
+          if ($dl['meta']['status'] == 200) {
+            $start = true;
+            $update = false;
+            // now walk through the downloadable files
+            foreach ($dl['data'] as $file) {
+              // increase the download counter for the repository
+              $downloads += $file['download_count'];
+              if (($start) && ($file['name'] != $data['download_file_name']))
+                $update = true;
+            }
+            if ($downloads != $data['download_total']) $update = true;
+            if ($update) {
+              // update the repository data
+              $upd = array(
+                  'download_active' => 1,
+                  'download_file_url' => $dl['data'][0]['html_url'],
+                  'download_file_name' => $dl['data'][0]['name'],
+                  'download_file_size' => $dl['data'][0]['size'],
+                  'download_file_date' => date('Y-m-d H:i:s', strtotime($dl['data'][0]['created_at'])),
+                  'download_total' => $downloads
+                  );
+              if (!$this->updateRepositoryData($data['id'], $upd)) {
+                self::$status['status_code'] = 'error';
+                self::$status['status_message'] = $this->getError();
+                self::$status['last_repository'] = $repo['name'];
+                self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+                $this->updateStatusData();
+                return false;
+              }
+            }
+          }
+          else {
+            $this->setError(sprintf('[%s - %s][%s] Status: %s', __METHOD__,
+                __LINE__, $get, $dl['meta']['status']));
+            self::$status['status_code'] = 'error';
+            self::$status['status_message'] = $this->getError();
+            self::$status['last_repository'] = $repo['name'];
+            self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+            $this->updateStatusData();
+            return false;
+          }
+        }
+        else {
+          // this repository has no downloads
+          if (($data['download_active'] == 1) && (!$this->updateRepositoryData($data['id'], $data))) {
+            self::$status['status_code'] = 'error';
+            self::$status['status_message'] = $this->getError();
+            self::$status['last_repository'] = $repo['name'];
+            self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+            $this->updateStatusData();
+            return false;
+          }
+        }
+      } // foreach repository
+    }
+    else {
+      // problem connecting to github, prompt the command and status
+      $this->setError(sprintf('[%s - %s][%s] Status: %s', __METHOD__, __LINE__,
+          $command, $worker['meta']['status']));
+      self::$status['status_code'] = 'error';
+      self::$status['status_message'] = $this->getError();
+      self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+      $this->updateStatusData();
+      return false;
+    }
+    self::$status['status_code'] = 'ok';
+    self::$status['status_message'] = '';
+    self::$status['last_repository'] = $repo['name'];
+    self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+    $this->updateStatusData();
+    return true;
+  } // getRepositories()
+
+} // class githubDownloads
+
+
+
+/**
+ * Create a table for the download statistics and acces to the active
+ * download file
+ *
+ * @return boolean|string TRUE on success or error message
+ */
+function createTable() {
+  global $database;
+  // create the table for the repositories
+  $SQL = "CREATE TABLE IF NOT EXISTS `" . TABLE_PREFIX . "mod_github_downloads` ( " .
+      "`id` INT(11) NOT NULL AUTO_INCREMENT, " .
+      "`owner` VARCHAR(255) NOT NULL DEFAULT '', ".
+      "`is_organisation` TINYINT NOT NULL DEFAULT '1', ".
+      "`repository_name` VARCHAR(255) NOT NULL DEFAULT '', ".
+      "`repository_url` TEXT, ".
+      "`download_active` TINYINT NOT NULL DEFAULT '0', ".
+      "`download_file_url` TEXT, ".
+      "`download_file_name` TEXT, ".
+      "`download_file_size` INT(11) NOT NULL DEFAULT '0', ".
+      "`download_file_date` DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00', ".
+      "`download_total` INT(11) NOT NULL DEFAULT '0', ".
+      "`timestamp` TIMESTAMP, " .
+      "PRIMARY KEY (`id`)" .
+      " ) ENGINE=MyIsam AUTO_INCREMENT=1 DEFAULT CHARSET utf8 COLLATE utf8_general_ci";
+  if (!$database->query($SQL)) {
+    return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
+  }
+  // create the table for the status
+  $SQL = "CREATE TABLE IF NOT EXISTS `".TABLE_PREFIX. "mod_github_downloads_status` ( ".
+      "`name` VARCHAR(255) NOT NULL DEFAULT '', ".
+      "`value` VARCHAR(255) NOT NULL DEFAULT '', ".
+      "`timestamp` TIMESTAMP, ".
+      "PRIMARY KEY (`name`)".
+      " ) ENGINE=MyIsam DEFAULT CHARSET utf8 COLLATE utf8_general_ci";
+  if (!$database->query($SQL)) {
+    return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
+  }
+  return true;
+} // createTable()
+
+/**
+ * Delete the table for download statistics
+ *
+ * @return string|boolean error message or TRUE on success
+ */
+function deleteTable() {
+  global $database;
+  if (!$database->query('DROP TABLE IF EXISTS `'.TABLE_PREFIX.'mod_github_downloads`')) {
+    return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
+  }
+  if (!$database->query('DROP TABLE IF EXISTS `'.TABLE_PREFIX.'mod_github_downloads_status`')) {
+    return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
+  }
+  return true;
+} // deleteTable()
+
