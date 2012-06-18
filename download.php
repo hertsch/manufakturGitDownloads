@@ -34,5 +34,11 @@ if (isset($_GET['file'])) {
   header('Location: '.$data['download_file_url']);
 }
 else {
+  // we assume that the download.php is located in the root!
+  $test = substr($_SERVER['REQUEST_URI'], strlen('/download/'));
+  if (strlen($test) > 3) {
+    // perhaps tried to call a subdirectory, rewrite as parameter
+    header(sprintf('Location: %s/download.php?file=%s', WB_URL, $test));
+  }
   exit("Please use the parameter 'file'.");
 }
