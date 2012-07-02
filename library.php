@@ -126,7 +126,11 @@ class githubDownloads {
    * @return mixed
    */
   protected function gitGet($get) {
-    $ch = curl_init("https://api.github.com$get?callback=return");
+    if (strpos($get, 'https://api.github.com') === 0)
+      $command = $get;
+    else
+      $command = "https://api.github.com$get?callback=return";
+    $ch = curl_init($command);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     $result = curl_exec($ch);
     curl_close($ch);
@@ -294,10 +298,18 @@ class githubDownloads {
    */
   public function getRepositories() {
     global $database;
-    $command = "/orgs/".self::$config['owner']."/repos";
+    // get the last status
+    $this->getStatusData();
+    if (self::$status['status_code'] == 'next_page') {
+      // get the command to call the next page
+      $command = self::$status['status_message'];
+    }
+    else {
+      // build the command to get the available repositories
+      $command = "/orgs/".self::$config['owner']."/repos";
+    }
     $worker = $this->gitGet($command);
     $repos = array();
-    $this->getStatusData();
     if (!isset($worker['meta'])) {
       // general error connecting to github
       $this->setError(sprintf('[%s - %s][%s] %s', __METHOD__, __LINE__, $command,
@@ -412,10 +424,20 @@ class githubDownloads {
       $this->updateStatusData();
       return false;
     }
-    self::$status['status_code'] = 'ok';
-    self::$status['status_message'] = '';
-    self::$status['last_repository'] = $repo['name'];
-    self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+    if (isset($worker['meta']['Link'][0][1]['rel']) && ($worker['meta']['Link'][0][1]['rel'] == 'next')) {
+      // there exist a further page - call this at the next execution!
+      self::$status['status_code'] = 'next_page';
+      self::$status['status_message'] = $worker['meta']['Link'][0][0];
+      self::$status['last_repository'] = $repo['name'];
+      self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+    }
+    else {
+      // all done
+      self::$status['status_code'] = 'ok';
+      self::$status['status_message'] = '';
+      self::$status['last_repository'] = $repo['name'];
+      self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+    }
     $this->updateStatusData();
     return true;
   } // getRepositories()
