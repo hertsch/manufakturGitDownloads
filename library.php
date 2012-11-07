@@ -36,18 +36,18 @@ if (!defined('LEPTON_PATH')) require_once WB_PATH . '/modules/' . basename(dirna
 
 class githubDownloads {
 
-  static private $error = '';
-  static private $config_file = '';
-  static public $config = array();
-  static public $status = array(
+  private static $error = '';
+  private static $config_file = '';
+  public static $config = array();
+  public static $status = array(
       'status_code' => 'ok',
       'status_message' => '',
       'last_repository' => '',
       'execution_time' => 0
       );
-  static private $script_time_start = 0;
-  static private $script_time_max = 25;
-
+  private static $script_time_start = 0;
+  private static $script_time_max = 25;
+  public static $x_ratelimit_min = 5;
 
 
   /**
@@ -119,25 +119,6 @@ class githubDownloads {
     return $result;
   } // readConfiguration()
 
-  /**
-   * GET command to Github
-   *
-   * @param string $get
-   * @return mixed
-   */
-  protected function gitGet($get) {
-    if (strpos($get, 'https://api.github.com') === 0)
-      $command = $get;
-    else
-      $command = "https://api.github.com$get?callback=return";
-    $ch = curl_init($command);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    $result = curl_exec($ch);
-    curl_close($ch);
-    $matches = array();
-    preg_match('/{(.*)}/', $result, $matches);
-    return json_decode($matches[0], true);
-  } // gitGet()
 
   /**
    * Get the data for a repository from the database
@@ -292,6 +273,79 @@ class githubDownloads {
   } // getStatusData()
 
   /**
+   * GET command to Github
+   *
+   * @param string $get
+   * @return mixed
+   */
+  protected function gitGet($get, $params='') {
+    if (strpos($get, 'https://api.github.com') === 0)
+      $command = $get;
+    else
+      $command = "https://api.github.com$get?callback=return";
+
+    if (isset(self::$config['access_token']) && (!empty(self::$config['access_token'])))
+      $command .= '&access_token='.self::$config['access_token'];
+    if (!empty($params))
+      $command .= "&$params";
+
+    $ch = curl_init($command);
+
+    $options = array(
+        CURLOPT_RETURNTRANSFER => true,
+        );
+    curl_setopt_array($ch, $options);
+
+    $result = curl_exec($ch);
+    curl_close($ch);
+    $matches = array();
+    preg_match('/{(.*)}/', $result, $matches);
+    return json_decode($matches[0], true);
+
+  } // gitGet()
+
+  protected function gitPut($put) {
+    $ch = curl_init();
+    if (strpos($put, 'https://api.github.com') === 0)
+      $command = $put;
+    else
+      $command = "https://api.github.com$put";
+    $curl_opt = array(
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_USERAGENT => 'manufakturGitDownloads',
+        CURLOPT_URL => $command,
+        CURLOPT_POST => true
+    );
+    curl_setopt_array($ch, $curl_opt);
+    $result = curl_exec($ch);
+    $status = curl_getinfo($ch);
+    curl_close($ch);
+    if (($status['http_code'] == '200') || ($status['http_code'] == '201')) {
+      return $result;
+    }
+    else {
+      $this->setError(sprintf('[%s - %s] %s: %s', __METHOD__, __LINE__, $status['http_code'], $result));
+      return false;
+    }
+  } // gitPut()
+
+  protected function gitAuthenticate($user, $password) {
+    $ch = curl_init();
+    $curl_opt = array(
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_URL => 'https://api.github.com',
+        CURLOPT_USERPWD => 'hertsch:sfYDJhOYgJDvD6S8zWSg'
+
+    );
+    curl_setopt_array($ch, $curl_opt);
+    $result = curl_exec($ch);
+    $status = curl_getinfo($ch);
+    curl_close();
+    return $result;
+  }
+
+  /**
    * Connect to github, walk through all repositories of the owner and get the download statistics
    *
    * @return boolean true on success
@@ -302,13 +356,17 @@ class githubDownloads {
     $this->getStatusData();
     if (self::$status['status_code'] == 'next_page') {
       // get the command to call the next page
-      $command = self::$status['status_message'];
+      $command = self::$status['status_message'].'/repos';
     }
     else {
       // build the command to get the available repositories
-      $command = "/orgs/".self::$config['owner']."/repos";
+      $command = "/orgs/".self::$config['owner'].'/repos';
     }
     $worker = $this->gitGet($command);
+//echo "<pre>";
+//print_r($worker);
+//echo "</pre>";
+
     $repos = array();
     if (!isset($worker['meta'])) {
       // general error connecting to github
@@ -322,17 +380,24 @@ class githubDownloads {
     }
     elseif ($worker['meta']['status'] == 200) {
       foreach ($worker['data'] as $repo) {
+echo "repo: {$repo['name']}<br>";
         if (self::$status['status_code'] == 'abort') {
+echo "abort mode <br>";
           if ($repo['name'] == self::$status['last_repository']) {
-            self::$status['status_code'] = 'ok';
+echo "hit!<br>";
+            self::$status['status_code'] = 'ok - abort';
           }
           else {
             // walk through without further action
+echo "continue!<br>";
             continue;
           }
         }
-        if ((microtime(true) - self::$script_time_start) > self::$script_time_max) {
-          // abort script before running out of time...
+
+        if (((microtime(true) - self::$script_time_start) > self::$script_time_max) ||
+            ($worker['meta']['X-RateLimit-Remaining'] < self::$x_ratelimit_min)) {
+          // abort script before running out of time or out of X-RateLimit...
+echo "abort w\limit {$worker['meta']['X-RateLimit-Remaining']}<br>";
           self::$status['status_code'] = 'abort';
           self::$status['status_message'] = '';
           self::$status['last_repository'] = $repo['name'];
@@ -355,11 +420,22 @@ class githubDownloads {
           }
         }
         $downloads = 0;
+
         if ($repo['has_downloads'] == 1) {
           // this repositories has downloads
           $get = "/repos/".self::$config['owner']."/".$repo['name']."/downloads";
           $dl = $this->gitGet($get);
           if ($dl['meta']['status'] == 200) {
+            if ($dl['meta']['X-RateLimit-Remaining'] < self::$x_ratelimit_min) {
+              // abort script before running out of X-RateLimit...
+echo "abort2 w\limit: {$dl['meta']['X-RateLimit-Remaining']}<br>";
+              self::$status['status_code'] = 'abort';
+              self::$status['status_message'] = '';
+              self::$status['last_repository'] = $repo['name'];
+              self::$status['execution_time'] = microtime(true)-self::$script_time_start;
+              $this->updateStatusData();
+              return true;
+            }
             $start = true;
             $update = false;
             // now walk through the downloadable files
@@ -391,8 +467,8 @@ class githubDownloads {
             }
           }
           else {
-            $this->setError(sprintf('[%s - %s][%s] Status: %s', __METHOD__,
-                __LINE__, $get, $dl['meta']['status']));
+            $this->setError(sprintf('[%s - %s][%s] Status: %s - %s', __METHOD__,
+                __LINE__, $get, $dl['meta']['status'], $dl['data']['message']));
             self::$status['status_code'] = 'error';
             self::$status['status_message'] = $this->getError();
             self::$status['last_repository'] = $repo['name'];
@@ -412,12 +488,13 @@ class githubDownloads {
             return false;
           }
         }
+
       } // foreach repository
     }
     else {
       // problem connecting to github, prompt the command and status
-      $this->setError(sprintf('[%s - %s][%s] Status: %s', __METHOD__, __LINE__,
-          $command, $worker['meta']['status']));
+      $this->setError(sprintf('[%s - %s][%s] Status: %s - %s', __METHOD__, __LINE__,
+          $command, $worker['meta']['status'], $worker['data']['message']));
       self::$status['status_code'] = 'error';
       self::$status['status_message'] = $this->getError();
       self::$status['execution_time'] = microtime(true)-self::$script_time_start;
