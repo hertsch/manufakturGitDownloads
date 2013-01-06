@@ -34,6 +34,24 @@ else {
 // wb2lepton compatibility
 if (!defined('LEPTON_PATH')) require_once WB_PATH . '/modules/' . basename(dirname(__FILE__)) . '/wb2lepton.php';
 
+if (file_exists(WB_PATH.'/modules/pclzip/pclzip.lib.php')) {
+  // LEPTON 1.x
+  require_once WB_PATH.'/modules/pclzip/pclzip.lib.php';
+}
+elseif (file_exists(WB_PATH.'/modules/lib_pclzip/pclzip.lib.php')) {
+  // LEPTON 2.x
+  require_once WB_PATH.'/modules/lib_pclzip/pclzip.lib.php';
+}
+elseif (file_exists(WB_PATH.'/include/pclzip/pclzip.lib.php')) {
+  // WebsiteBaker
+  require_once WB_PATH.'/include/pclzip/pclzip.lib.php';
+}
+else {
+  trigger_error(sprintf("[ <b>%s</b> ] Unable to find pclzip!", $_SERVER['SCRIPT_NAME']), E_USER_ERROR);
+}
+// set temporary directory for pclzip
+if (!defined('PCLZIP_TEMPORARY_DIR')) define('PCLZIP_TEMPORARY_DIR', WB_PATH.'/temp/');
+
 class githubDownloads {
 
   private static $error = '';
@@ -363,9 +381,6 @@ class githubDownloads {
       $command = "/orgs/".self::$config['owner'].'/repos';
     }
     $worker = $this->gitGet($command);
-//echo "<pre>";
-//print_r($worker);
-//echo "</pre>";
 
     $repos = array();
     if (!isset($worker['meta'])) {
@@ -380,16 +395,12 @@ class githubDownloads {
     }
     elseif ($worker['meta']['status'] == 200) {
       foreach ($worker['data'] as $repo) {
-echo "repo: {$repo['name']}<br>";
         if (self::$status['status_code'] == 'abort') {
-echo "abort mode <br>";
           if ($repo['name'] == self::$status['last_repository']) {
-echo "hit!<br>";
             self::$status['status_code'] = 'ok - abort';
           }
           else {
             // walk through without further action
-echo "continue!<br>";
             continue;
           }
         }
@@ -397,7 +408,6 @@ echo "continue!<br>";
         if (((microtime(true) - self::$script_time_start) > self::$script_time_max) ||
             ($worker['meta']['X-RateLimit-Remaining'] < self::$x_ratelimit_min)) {
           // abort script before running out of time or out of X-RateLimit...
-echo "abort w\limit {$worker['meta']['X-RateLimit-Remaining']}<br>";
           self::$status['status_code'] = 'abort';
           self::$status['status_message'] = '';
           self::$status['last_repository'] = $repo['name'];
@@ -428,7 +438,6 @@ echo "abort w\limit {$worker['meta']['X-RateLimit-Remaining']}<br>";
           if ($dl['meta']['status'] == 200) {
             if ($dl['meta']['X-RateLimit-Remaining'] < self::$x_ratelimit_min) {
               // abort script before running out of X-RateLimit...
-echo "abort2 w\limit: {$dl['meta']['X-RateLimit-Remaining']}<br>";
               self::$status['status_code'] = 'abort';
               self::$status['status_message'] = '';
               self::$status['last_repository'] = $repo['name'];
@@ -519,6 +528,76 @@ echo "abort2 w\limit: {$dl['meta']['X-RateLimit-Remaining']}<br>";
     return true;
   } // getRepositories()
 
+
+  /**
+   * Iterate directory tree very efficient
+   * Function postet from donovan.pp@gmail.com at
+   * http://www.php.net/manual/de/function.scandir.php
+   *
+   * @param STR $dir
+   * @return ARRAY - directoryTree
+   */
+  public function directoryTree($dir) {
+    if (substr($dir,-1) == "/") $dir = substr($dir,0,-1);
+    $path = array();
+    $stack = array();
+    $stack[] = $dir;
+    while ($stack) {
+      $thisdir = array_pop($stack);
+      if (false !== ($dircont = scandir($thisdir))) {
+        $i=0;
+        while (isset($dircont[$i])) {
+          if ($dircont[$i] !== '.' && $dircont[$i] !== '..') {
+            $current_file = "{$thisdir}/{$dircont[$i]}";
+            if (is_file($current_file)) {
+              $path[] = "{$thisdir}/{$dircont[$i]}";
+            }
+            elseif (is_dir($current_file)) {
+              $stack[] = $current_file;
+            }
+          }
+          $i++;
+        }
+      }
+    }
+    return $path;
+  } // directoryTree()
+
+  public function scanDownloads() {
+    global $database;
+
+    $dir = $this->directoryTree(WB_PATH.'/media/downloads');
+
+    $ignore = array('.htaccess','.htpasswd');
+    foreach ($dir as $file) {
+      if (!is_file($file)) continue;
+      $basename = basename($file, '.zip');
+      if (in_array($basename, $ignore)) continue;
+      $addon = substr($basename, 0, strrpos($basename, '_'));
+      $release = substr($basename, strrpos($basename, '_')+1 );
+      //echo "$basename --> $addon --> $release<br>";
+      $SQL = "SELECT `id` FROM `".TABLE_PREFIX."mod_manufaktur_downloads` WHERE `addon`='$addon' AND `release`='$release'";
+      $id = $database->get_one($SQL, MYSQL_ASSOC);
+      if ($database->is_error()) {
+        $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+        return false;
+      }
+      if ($id < 1) {
+        echo "add: $basename<br>";
+        $file_datetime = date('Y-m-d H:i:s', filemtime($file));
+        $file_size = filesize($file);
+        $SQL = "INSERT INTO `".TABLE_PREFIX."mod_manufaktur_downloads` (`addon`,`release`,`file_name`,`file_datetime`,`file_size`) VALUES ".
+            "('$addon','$release','$file','$file_datetime','$file_size')";
+        $database->query($SQL);
+        if ($database->is_error()) {
+          $this->setError(sprintf('[%s - %s] %s', __METHOD__, __LINE__, $database->get_error()));
+          return false;
+        }
+      }
+    }
+    return true;
+  } // scanDownloads()
+
 } // class githubDownloads
 
 
@@ -560,6 +639,24 @@ function createTable() {
   if (!$database->query($SQL)) {
     return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
   }
+
+  // create the table for the downloads
+  $SQL = "CREATE TABLE IF NOT EXISTS `".TABLE_PREFIX. "mod_manufaktur_downloads` ( ".
+      "`id` INT(11) NOT NULL AUTO_INCREMENT, " .
+      "`addon` VARCHAR(255) NOT NULL DEFAULT '', ".
+      "`release` VARCHAR(20) NOT NULL DEFAULT '', ".
+      "`file_name` TEXT, ".
+      "`file_datetime` DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00', ".
+      "`file_size` INT(11) NOT NULL DEFAULT '0', ".
+      "`downloads` INT(11) NOT NULL DEFAULT '0', ".
+      "`status` ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE', ".
+      "`timestamp` TIMESTAMP, ".
+      "PRIMARY KEY (`id`)".
+      " ) ENGINE=MyIsam DEFAULT CHARSET utf8 COLLATE utf8_general_ci";
+  if (!$database->query($SQL)) {
+    return sprintf('[%s - %s] %s', __FUNCTION__, __LINE__, $database->get_error());
+  }
+
   return true;
 } // createTable()
 
